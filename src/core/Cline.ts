@@ -800,6 +800,10 @@ export class Cline {
 		if (!mcpHub) {
 			throw new Error("MCP hub not available")
 		}
+		else
+		{
+			console.log(mcpHub)
+		}
 
 		let systemPrompt = await SYSTEM_PROMPT(cwd, this.api.getModel().info.supportsComputerUse ?? false, mcpHub)
 		let settingsCustomInstructions = this.customInstructions?.trim()
@@ -2287,6 +2291,10 @@ export class Cline {
 		userContent = parsedUserContent
 		// add environment details as its own text block, separate from tool results
 		userContent.push({ type: "text", text: environmentDetails })
+		// if(userContent)
+		// {
+		// 	console.log(userContent)
+		// }
 
 		await this.addToApiConversationHistory({ role: "user", content: userContent })
 
@@ -2472,6 +2480,7 @@ export class Cline {
 			// need to save assistant responses to file before proceeding to tool use since user can exit at any moment and we wouldn't be able to save the assistant's response
 			let didEndLoop = false
 			if (assistantMessage.length > 0) {
+				// console.log(assistantMessage) //打印输出prompt
 				await this.addToApiConversationHistory({
 					role: "assistant",
 					content: [{ type: "text", text: assistantMessage }],
