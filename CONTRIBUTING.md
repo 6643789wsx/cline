@@ -1,12 +1,8 @@
-# 🤖 Contributing to Cline
+# Contributing to Cline
 
-Welcome, human! We're thrilled you're interested in contributing to Cline. Whether you're fixing a bug, adding a feature, or improving our docs, every contribution makes Cline smarter!
+We're thrilled you're interested in contributing to Cline. Whether you're fixing a bug, adding a feature, or improving our docs, every contribution makes Cline smarter! To keep our community vibrant and welcoming, all members must adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## ✌️ Being Part of the Community
-
-We have an awesome, diverse, and inclusive community of humans (and friendly AI assistants). To keep our community vibrant and welcoming, all members must adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
-
-## 🐛 Reporting Bugs or Issues
+## Reporting Bugs or Issues
 
 Bug reports help make Cline better for everyone! Before creating a new issue, please [search existing ones](https://github.com/cline/cline/issues) to avoid duplicates. When you're ready to report a bug, head over to our [issues page](https://github.com/cline/cline/issues/new/choose) where you'll find a template to help you with filling out the relevant information.
 
@@ -14,53 +10,70 @@ Bug reports help make Cline better for everyone! Before creating a new issue, pl
      🔐 <b>Important:</b> If you discover a security vulnerability, please use the <a href="https://github.com/cline/cline/security/advisories/new">Github security tool to report it privately</a>.
 </blockquote>
 
-## 🎯 Deciding What to Work On
+## Deciding What to Work On
 
-See something that could be improved? Feel free to create a pull request directly! Whether it's fixing a typo or adding a cool new AI feature, we love surprises (the good kind, not the "undefined is not a function" kind).
+Looking for a good first contribution? Check out issues labeled ["good first issue"](https://github.com/cline/cline/labels/good%20first%20issue) or ["help wanted"](https://github.com/cline/cline/labels/help%20wanted). These are specifically curated for new contributors and areas where we'd love some help!
 
-If you're planning to work on a bigger feature, please create an issue first so we can discuss whether it aligns with Cline's vision.
+We also welcome contributions to our [documentation](https://github.com/cline/cline/tree/main/docs)! Whether it's fixing typos, improving existing guides, or creating new educational content - we'd love to build a community-driven repository of resources that helps everyone get the most out of Cline. You can start by diving into `/docs` and looking for areas that need improvement.
 
-## 💻 Writing and Submitting Code
+If you're planning to work on a bigger feature, please create a [feature request](https://github.com/cline/cline/discussions/categories/feature-requests?discussions_q=is%3Aopen+category%3A%22Feature+Requests%22+sort%3Atop) first so we can discuss whether it aligns with Cline's vision.
+
+## Development Setup
+
+1. **VS Code Extensions**
+
+    - When opening the project, VS Code will prompt you to install recommended extensions
+    - These extensions are required for development - please accept all installation prompts
+    - If you dismissed the prompts, you can install them manually from the Extensions panel
+
+2. **Local Development**
+    - Run `npm install` to install dependencies
+    - Run `npm run test` to run tests locally
+    - Before submitting PR, run `npm run format:fix` to format your code
+
+## Writing and Submitting Code
 
 Anyone can contribute code to Cline, but we ask that you follow these guidelines to ensure your contributions can be smoothly integrated:
 
 1. **Keep Pull Requests Focused**
-   - Limit PRs to a single feature or bug fix
-   - Split larger changes into smaller, related PRs
-   - Try and limit the PR to a single commit
+
+    - Limit PRs to a single feature or bug fix
+    - Split larger changes into smaller, related PRs
+    - Break changes into logical commits that can be reviewed independently
 
 2. **Code Quality**
-   - Run `npm run lint` to ensure code follows our style guidelines
-   - Run `npm run format` to format your code with Prettier
-   - Address any ESLint warnings or errors before submitting
-   - Follow TypeScript best practices and maintain type safety
+
+    - Run `npm run lint` to check code style
+    - Run `npm run format` to automatically format code
+    - All PRs must pass CI checks which include both linting and formatting
+    - Address any ESLint warnings or errors before submitting
+    - Follow TypeScript best practices and maintain type safety
 
 3. **Testing**
-   - Add tests for new features
-   - Run `npm test` to ensure all tests pass
-   - Update existing tests if your changes affect them
-   - Include both unit tests and integration tests where appropriate
 
-4. **Documentation**
-   - Update documentation for any changed functionality
-   - Update the README if your changes affect usage or setup
+    - Add tests for new features
+    - Run `npm test` to ensure all tests pass
+    - Update existing tests if your changes affect them
+    - Include both unit tests and integration tests where appropriate
 
-5. **Commit Guidelines**
-   - Write clear, descriptive commit messages
-   - Use conventional commit format (e.g., "feat:", "fix:", "docs:")
-   - Reference relevant issues in commits using #issue-number
+4. **Commit Guidelines**
 
-6. **Before Submitting**
-   - Rebase your branch on the latest main
-   - Ensure your branch builds successfully
-   - Double-check all tests are passing
-   - Review your changes for any debugging code or console logs
+    - Write clear, descriptive commit messages
+    - Use conventional commit format (e.g., "feat:", "fix:", "docs:")
+    - Reference relevant issues in commits using #issue-number
 
-7. **Pull Request Description**
-   - Clearly describe what your changes do
-   - Include steps to test the changes
-   - List any breaking changes
-   - Add screenshots for UI changes
+5. **Before Submitting**
+
+    - Rebase your branch on the latest main
+    - Ensure your branch builds successfully
+    - Double-check all tests are passing
+    - Review your changes for any debugging code or console logs
+
+6. **Pull Request Description**
+    - Clearly describe what your changes do
+    - Include steps to test the changes
+    - List any breaking changes
+    - Add screenshots for UI changes
 
 ## Contribution Agreement
 
