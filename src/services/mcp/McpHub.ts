@@ -1,5 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { StdioClientTransport, StdioServerParameters } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import {
 	CallToolResultSchema,
 	ListResourcesResultSchema,
@@ -8,32 +8,68 @@ import {
 	ReadResourceResultSchema,
 } from "@modelcontextprotocol/sdk/types.js"
 import chokidar, { FSWatcher } from "chokidar"
-import delay from "delay"
+import { setTimeout as setTimeoutPromise } from "node:timers/promises"
 import deepEqual from "fast-deep-equal"
 import * as fs from "fs/promises"
 import * as path from "path"
 import * as vscode from "vscode"
 import { z } from "zod"
-import { ClineProvider, GlobalFileNames } from "../../core/webview/ClineProvider"
-import { McpResource, McpResourceResponse, McpResourceTemplate, McpServer, McpTool, McpToolCallResponse } from "../../shared/mcp"
+import { ClineProvider } from "../../core/webview/ClineProvider"
+import {
+	DEFAULT_MCP_TIMEOUT_SECONDS,
+	McpMode,
+	McpResource,
+	McpResourceResponse,
+	McpResourceTemplate,
+	McpServer,
+	McpTool,
+	McpToolCallResponse,
+	MIN_MCP_TIMEOUT_SECONDS,
+} from "../../shared/mcp"
 import { fileExistsAtPath } from "../../utils/fs"
 import { arePathsEqual } from "../../utils/path"
+import { secondsToMs } from "../../utils/time"
+import { GlobalFileNames } from "../../global-constants"
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js"
 
 export type McpConnection = {
 	server: McpServer
 	client: Client
-	transport: StdioClientTransport
+	transport: StdioClientTransport | SSEClientTransport
 }
 
-// StdioServerParameters
-const StdioConfigSchema = z.object({
+export type McpTransportType = "stdio" | "sse"
+
+export type McpServerConfig = z.infer<typeof ServerConfigSchema>
+
+const AutoApproveSchema = z.array(z.string()).default([])
+
+const BaseConfigSchema = z.object({
+	autoApprove: AutoApproveSchema.optional(),
+	disabled: z.boolean().optional(),
+	timeout: z.number().min(MIN_MCP_TIMEOUT_SECONDS).optional().default(DEFAULT_MCP_TIMEOUT_SECONDS),
+})
+
+const SseConfigSchema = BaseConfigSchema.extend({
+	url: z.string().url(),
+}).transform((config) => ({
+	...config,
+	transportType: "sse" as const,
+}))
+
+const StdioConfigSchema = BaseConfigSchema.extend({
 	command: z.string(),
 	args: z.array(z.string()).optional(),
 	env: z.record(z.string()).optional(),
-})
+}).transform((config) => ({
+	...config,
+	transportType: "stdio" as const,
+}))
+
+const ServerConfigSchema = z.union([StdioConfigSchema, SseConfigSchema])
 
 const McpSettingsSchema = z.object({
-	mcpServers: z.record(StdioConfigSchema),
+	mcpServers: z.record(ServerConfigSchema),
 })
 
 export class McpHub {
@@ -51,7 +87,12 @@ export class McpHub {
 	}
 
 	getServers(): McpServer[] {
-		return this.connections.map((conn) => conn.server)
+		// Only return enabled servers
+		return this.connections.filter((conn) => !conn.server.disabled).map((conn) => conn.server)
+	}
+
+	getMode(): McpMode {
+		return vscode.workspace.getConfiguration("cline.mcp").get<McpMode>("mode", "full")
 	}
 
 	async getMcpServersPath(): Promise<string> {
@@ -83,32 +124,51 @@ export class McpHub {
 		return mcpSettingsFilePath
 	}
 
+	private async readAndValidateMcpSettingsFile(): Promise<z.infer<typeof McpSettingsSchema> | undefined> {
+		try {
+			const settingsPath = await this.getMcpSettingsFilePath()
+			const content = await fs.readFile(settingsPath, "utf-8")
+
+			let config: any
+
+			// Parse JSON file content
+			try {
+				config = JSON.parse(content)
+			} catch (error) {
+				vscode.window.showErrorMessage(
+					"Invalid MCP settings format. Please ensure your settings follow the correct JSON format.",
+				)
+				return undefined
+			}
+
+			// Validate against schema
+			const result = McpSettingsSchema.safeParse(config)
+			if (!result.success) {
+				vscode.window.showErrorMessage("Invalid MCP settings schema.")
+				return undefined
+			}
+
+			return result.data
+		} catch (error) {
+			console.error("Failed to read MCP settings:", error)
+			return undefined
+		}
+	}
+
 	private async watchMcpSettingsFile(): Promise<void> {
 		const settingsPath = await this.getMcpSettingsFilePath()
 		this.disposables.push(
 			vscode.workspace.onDidSaveTextDocument(async (document) => {
 				if (arePathsEqual(document.uri.fsPath, settingsPath)) {
-					const content = await fs.readFile(settingsPath, "utf-8")
-					const errorMessage =
-						"Invalid MCP settings format. Please ensure your settings follow the correct JSON format."
-					let config: any
-					try {
-						config = JSON.parse(content)
-					} catch (error) {
-						vscode.window.showErrorMessage(errorMessage)
-						return
-					}
-					const result = McpSettingsSchema.safeParse(config)
-					if (!result.success) {
-						vscode.window.showErrorMessage(errorMessage)
-						return
-					}
-					try {
-						vscode.window.showInformationMessage("Updating MCP servers...")
-						await this.updateServerConnections(result.data.mcpServers || {})
-						vscode.window.showInformationMessage("MCP servers updated")
-					} catch (error) {
-						console.error("Failed to process MCP settings change:", error)
+					const settings = await this.readAndValidateMcpSettingsFile()
+					if (settings) {
+						try {
+							vscode.window.showInformationMessage("Updating MCP servers...")
+							await this.updateServerConnections(settings.mcpServers)
+							vscode.window.showInformationMessage("MCP servers updated")
+						} catch (error) {
+							console.error("Failed to process MCP settings change:", error)
+						}
 					}
 				}
 			}),
@@ -116,17 +176,16 @@ export class McpHub {
 	}
 
 	private async initializeMcpServers(): Promise<void> {
-		try {
-			const settingsPath = await this.getMcpSettingsFilePath()
-			const content = await fs.readFile(settingsPath, "utf-8")
-			const config = JSON.parse(content)
-			await this.updateServerConnections(config.mcpServers || {})
-		} catch (error) {
-			console.error("Failed to initialize MCP servers:", error)
+		const settings = await this.readAndValidateMcpSettingsFile()
+		if (settings) {
+			await this.updateServerConnections(settings.mcpServers)
 		}
 	}
 
-	private async connectToServer(name: string, config: StdioServerParameters): Promise<void> {
+	private async connectToServer(
+		name: string,
+		config: z.infer<typeof StdioConfigSchema> | z.infer<typeof SseConfigSchema>,
+	): Promise<void> {
 		// Remove existing connection if it exists (should never happen, the connection should be deleted beforehand)
 		this.connections = this.connections.filter((conn) => conn.server.name !== name)
 
@@ -142,16 +201,22 @@ export class McpHub {
 				},
 			)
 
-			const transport = new StdioClientTransport({
-				command: config.command,
-				args: config.args,
-				env: {
-					...config.env,
-					...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-					// ...(process.env.NODE_PATH ? { NODE_PATH: process.env.NODE_PATH } : {}),
-				},
-				stderr: "pipe", // necessary for stderr to be available
-			})
+			let transport: StdioClientTransport | SSEClientTransport
+
+			if (config.transportType === "sse") {
+				transport = new SSEClientTransport(new URL(config.url), {})
+			} else {
+				transport = new StdioClientTransport({
+					command: config.command,
+					args: config.args,
+					env: {
+						...config.env,
+						...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+						// ...(process.env.NODE_PATH ? { NODE_PATH: process.env.NODE_PATH } : {}),
+					},
+					stderr: "pipe", // necessary for stderr to be available
+				})
+			}
 
 			transport.onerror = async (error) => {
 				console.error(`Transport error for "${name}":`, error)
@@ -171,79 +236,42 @@ export class McpHub {
 				await this.notifyWebviewOfServerChanges()
 			}
 
-			// If the config is invalid, show an error
-			if (!StdioConfigSchema.safeParse(config).success) {
-				console.error(`Invalid config for "${name}": missing or invalid parameters`)
-				const connection: McpConnection = {
-					server: {
-						name,
-						config: JSON.stringify(config),
-						status: "disconnected",
-						error: "Invalid config: missing or invalid parameters",
-					},
-					client,
-					transport,
-				}
-				this.connections.push(connection)
-				return
-			}
-
-			// valid schema
 			const connection: McpConnection = {
 				server: {
 					name,
 					config: JSON.stringify(config),
 					status: "connecting",
+					disabled: config.disabled,
 				},
 				client,
 				transport,
 			}
 			this.connections.push(connection)
 
-			// transport.stderr is only available after the process has been started. However we can't start it separately from the .connect() call because it also starts the transport. And we can't place this after the connect call since we need to capture the stderr stream before the connection is established, in order to capture errors during the connection process.
-			// As a workaround, we start the transport ourselves, and then monkey-patch the start method to no-op so that .connect() doesn't try to start it again.
-			await transport.start()
-			const stderrStream = transport.stderr
-			if (stderrStream) {
-				stderrStream.on("data", async (data: Buffer) => {
-					const errorOutput = data.toString()
-					console.error(`Server "${name}" stderr:`, errorOutput)
-					const connection = this.connections.find((conn) => conn.server.name === name)
-					if (connection) {
-						// NOTE: we do not set server status to "disconnected" because stderr logs do not necessarily mean the server crashed or disconnected, it could just be informational. In fact when the server first starts up, it immediately logs "<name> server running on stdio" to stderr.
-						this.appendErrorMessage(connection, errorOutput)
-						// Only need to update webview right away if it's already disconnected
-						if (connection.server.status === "disconnected") {
-							await this.notifyWebviewOfServerChanges()
+			if (config.transportType === "stdio") {
+				// transport.stderr is only available after the process has been started. However we can't start it separately from the .connect() call because it also starts the transport. And we can't place this after the connect call since we need to capture the stderr stream before the connection is established, in order to capture errors during the connection process.
+				// As a workaround, we start the transport ourselves, and then monkey-patch the start method to no-op so that .connect() doesn't try to start it again.
+				await transport.start()
+				const stderrStream = (transport as StdioClientTransport).stderr
+				if (stderrStream) {
+					stderrStream.on("data", async (data: Buffer) => {
+						const errorOutput = data.toString()
+						console.error(`Server "${name}" stderr:`, errorOutput)
+						const connection = this.connections.find((conn) => conn.server.name === name)
+						if (connection) {
+							// NOTE: we do not set server status to "disconnected" because stderr logs do not necessarily mean the server crashed or disconnected, it could just be informational. In fact when the server first starts up, it immediately logs "<name> server running on stdio" to stderr.
+							this.appendErrorMessage(connection, errorOutput)
+							// Only need to update webview right away if it's already disconnected
+							if (connection.server.status === "disconnected") {
+								await this.notifyWebviewOfServerChanges()
+							}
 						}
-					}
-				})
-			} else {
-				console.error(`No stderr stream for ${name}`)
+					})
+				} else {
+					console.error(`No stderr stream for ${name}`)
+				}
+				transport.start = async () => {} // No-op now, .connect() won't fail
 			}
-			transport.start = async () => {} // No-op now, .connect() won't fail
-
-			// // Set up notification handlers
-			// client.setNotificationHandler(
-			// 	// @ts-ignore-next-line
-			// 	{ method: "notifications/tools/list_changed" },
-			// 	async () => {
-			// 		console.log(`Tools changed for server: ${name}`)
-			// 		connection.server.tools = await this.fetchTools(name)
-			// 		await this.notifyWebviewOfServerChanges()
-			// 	},
-			// )
-
-			// client.setNotificationHandler(
-			// 	// @ts-ignore-next-line
-			// 	{ method: "notifications/resources/list_changed" },
-			// 	async () => {
-			// 		console.log(`Resources changed for server: ${name}`)
-			// 		connection.server.resources = await this.fetchResources(name)
-			// 		connection.server.resourceTemplates = await this.fetchResourceTemplates(name)
-			// 		await this.notifyWebviewOfServerChanges()
-			// 	},
-			// )
 
 			// Connect
 			await client.connect(transport)
@@ -275,7 +303,21 @@ export class McpHub {
 			const response = await this.connections
 				.find((conn) => conn.server.name === serverName)
 				?.client.request({ method: "tools/list" }, ListToolsResultSchema)
-			return response?.tools || []
+
+			// Get autoApprove settings
+			const settingsPath = await this.getMcpSettingsFilePath()
+			const content = await fs.readFile(settingsPath, "utf-8")
+			const config = JSON.parse(content)
+			const autoApproveConfig = config.mcpServers[serverName]?.autoApprove || []
+
+			// Mark tools as always allowed based on settings
+			const tools = (response?.tools || []).map((tool) => ({
+				...tool,
+				autoApprove: autoApproveConfig.includes(tool.name),
+			}))
+
+			// console.log(`[MCP] Fetched tools for ${serverName}:`, tools)
+			return tools
 		} catch (error) {
 			// console.error(`Failed to fetch tools for ${serverName}:`, error)
 			return []
@@ -310,10 +352,6 @@ export class McpHub {
 		const connection = this.connections.find((conn) => conn.server.name === name)
 		if (connection) {
 			try {
-				// connection.client.removeNotificationHandler("notifications/tools/list_changed")
-				// connection.client.removeNotificationHandler("notifications/resources/list_changed")
-				// connection.client.removeNotificationHandler("notifications/stderr")
-				// connection.client.removeNotificationHandler("notifications/stderr")
 				await connection.transport.close()
 				await connection.client.close()
 			} catch (error) {
@@ -323,7 +361,7 @@ export class McpHub {
 		}
 	}
 
-	async updateServerConnections(newServers: Record<string, any>): Promise<void> {
+	async updateServerConnections(newServers: Record<string, McpServerConfig>): Promise<void> {
 		this.isConnecting = true
 		this.removeAllFileWatchers()
 		const currentNames = new Set(this.connections.map((conn) => conn.server.name))
@@ -344,7 +382,9 @@ export class McpHub {
 			if (!currentConnection) {
 				// New server
 				try {
-					this.setupFileWatcher(name, config)
+					if (config.transportType === "stdio") {
+						this.setupFileWatcher(name, config)
+					}
 					await this.connectToServer(name, config)
 				} catch (error) {
 					console.error(`Failed to connect to new MCP server ${name}:`, error)
@@ -352,7 +392,9 @@ export class McpHub {
 			} else if (!deepEqual(JSON.parse(currentConnection.server.config), config)) {
 				// Existing server with changed config
 				try {
-					this.setupFileWatcher(name, config)
+					if (config.transportType === "stdio") {
+						this.setupFileWatcher(name, config)
+					}
 					await this.deleteConnection(name)
 					await this.connectToServer(name, config)
 					console.log(`Reconnected MCP server with updated config: ${name}`)
@@ -405,7 +447,7 @@ export class McpHub {
 			connection.server.status = "connecting"
 			connection.server.error = ""
 			await this.notifyWebviewOfServerChanges()
-			await delay(500) // artificial delay to show user that server is restarting
+			await setTimeoutPromise(500) // artificial delay to show user that server is restarting
 			try {
 				await this.deleteConnection(serverName)
 				// Try to connect again using existing config
@@ -439,13 +481,98 @@ export class McpHub {
 		})
 	}
 
+	async sendLatestMcpServers() {
+		await this.notifyWebviewOfServerChanges()
+	}
+
 	// Using server
+
+	// Public methods for server management
+
+	public async toggleServerDisabled(serverName: string, disabled: boolean): Promise<void> {
+		let settingsPath: string
+		try {
+			settingsPath = await this.getMcpSettingsFilePath()
+
+			// Ensure the settings file exists and is accessible
+			try {
+				await fs.access(settingsPath)
+			} catch (error) {
+				console.error("Settings file not accessible:", error)
+				throw new Error("Settings file not accessible")
+			}
+			const content = await fs.readFile(settingsPath, "utf-8")
+			const config = JSON.parse(content)
+
+			// Validate the config structure
+			if (!config || typeof config !== "object") {
+				throw new Error("Invalid config structure")
+			}
+
+			if (!config.mcpServers || typeof config.mcpServers !== "object") {
+				config.mcpServers = {}
+			}
+
+			if (config.mcpServers[serverName]) {
+				// Create a new server config object to ensure clean structure
+				const serverConfig = {
+					...config.mcpServers[serverName],
+					disabled,
+				}
+
+				// Ensure required fields exist
+				if (!serverConfig.autoApprove) {
+					serverConfig.autoApprove = []
+				}
+
+				config.mcpServers[serverName] = serverConfig
+
+				// Write the entire config back
+				const updatedConfig = {
+					mcpServers: config.mcpServers,
+				}
+
+				await fs.writeFile(settingsPath, JSON.stringify(updatedConfig, null, 2))
+
+				const connection = this.connections.find((conn) => conn.server.name === serverName)
+				if (connection) {
+					try {
+						connection.server.disabled = disabled
+
+						// Only refresh capabilities if connected
+						if (connection.server.status === "connected") {
+							connection.server.tools = await this.fetchToolsList(serverName)
+							connection.server.resources = await this.fetchResourcesList(serverName)
+							connection.server.resourceTemplates = await this.fetchResourceTemplatesList(serverName)
+						}
+					} catch (error) {
+						console.error(`Failed to refresh capabilities for ${serverName}:`, error)
+					}
+				}
+
+				await this.notifyWebviewOfServerChanges()
+			}
+		} catch (error) {
+			console.error("Failed to update server disabled state:", error)
+			if (error instanceof Error) {
+				console.error("Error details:", error.message, error.stack)
+			}
+			vscode.window.showErrorMessage(
+				`Failed to update server state: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			throw error
+		}
+	}
 
 	async readResource(serverName: string, uri: string): Promise<McpResourceResponse> {
 		const connection = this.connections.find((conn) => conn.server.name === serverName)
 		if (!connection) {
 			throw new Error(`No connection found for server: ${serverName}`)
 		}
+		if (connection.server.disabled) {
+			throw new Error(`Server "${serverName}" is disabled`)
+		}
+
 		return await connection.client.request(
 			{
 				method: "resources/read",
@@ -464,6 +591,21 @@ export class McpHub {
 				`No connection found for server: ${serverName}. Please make sure to use MCP servers available under 'Connected MCP Servers'.`,
 			)
 		}
+
+		if (connection.server.disabled) {
+			throw new Error(`Server "${serverName}" is disabled and cannot be used`)
+		}
+
+		let timeout = secondsToMs(DEFAULT_MCP_TIMEOUT_SECONDS) // sdk expects ms
+
+		try {
+			const config = JSON.parse(connection.server.config)
+			const parsedConfig = ServerConfigSchema.parse(config)
+			timeout = secondsToMs(parsedConfig.timeout)
+		} catch (error) {
+			console.error(`Failed to parse timeout configuration for server ${serverName}: ${error}`)
+		}
+
 		return await connection.client.request(
 			{
 				method: "tools/call",
@@ -473,7 +615,112 @@ export class McpHub {
 				},
 			},
 			CallToolResultSchema,
+			{
+				timeout,
+			},
 		)
+	}
+
+	async toggleToolAutoApprove(serverName: string, toolNames: string[], shouldAllow: boolean): Promise<void> {
+		try {
+			const settingsPath = await this.getMcpSettingsFilePath()
+			const content = await fs.readFile(settingsPath, "utf-8")
+			const config = JSON.parse(content)
+
+			// Initialize autoApprove if it doesn't exist
+			if (!config.mcpServers[serverName].autoApprove) {
+				config.mcpServers[serverName].autoApprove = []
+			}
+
+			const autoApprove = config.mcpServers[serverName].autoApprove
+			for (const toolName of toolNames) {
+				const toolIndex = autoApprove.indexOf(toolName)
+
+				if (shouldAllow && toolIndex === -1) {
+					// Add tool to autoApprove list
+					autoApprove.push(toolName)
+				} else if (!shouldAllow && toolIndex !== -1) {
+					// Remove tool from autoApprove list
+					autoApprove.splice(toolIndex, 1)
+				}
+			}
+
+			await fs.writeFile(settingsPath, JSON.stringify(config, null, 2))
+
+			// Update the tools list to reflect the change
+			const connection = this.connections.find((conn) => conn.server.name === serverName)
+			if (connection) {
+				connection.server.tools = await this.fetchToolsList(serverName)
+				await this.notifyWebviewOfServerChanges()
+			}
+		} catch (error) {
+			console.error("Failed to update autoApprove settings:", error)
+			vscode.window.showErrorMessage("Failed to update autoApprove settings")
+			throw error // Re-throw to ensure the error is properly handled
+		}
+	}
+
+	public async deleteServer(serverName: string) {
+		try {
+			const settingsPath = await this.getMcpSettingsFilePath()
+			const content = await fs.readFile(settingsPath, "utf-8")
+			const config = JSON.parse(content)
+			if (!config.mcpServers || typeof config.mcpServers !== "object") {
+				config.mcpServers = {}
+			}
+			if (config.mcpServers[serverName]) {
+				delete config.mcpServers[serverName]
+				const updatedConfig = {
+					mcpServers: config.mcpServers,
+				}
+				await fs.writeFile(settingsPath, JSON.stringify(updatedConfig, null, 2))
+				await this.updateServerConnections(config.mcpServers)
+				vscode.window.showInformationMessage(`Deleted ${serverName} MCP server`)
+			} else {
+				vscode.window.showWarningMessage(`${serverName} not found in MCP configuration`)
+			}
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Failed to delete MCP server: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			throw error
+		}
+	}
+
+	public async updateServerTimeout(serverName: string, timeout: number): Promise<void> {
+		try {
+			// Validate timeout against schema
+			const setConfigResult = BaseConfigSchema.shape.timeout.safeParse(timeout)
+			if (!setConfigResult.success) {
+				throw new Error(`Invalid timeout value: ${timeout}. Must be at minimum ${MIN_MCP_TIMEOUT_SECONDS} seconds.`)
+			}
+
+			const settingsPath = await this.getMcpSettingsFilePath()
+			const content = await fs.readFile(settingsPath, "utf-8")
+			const config = JSON.parse(content)
+
+			if (!config.mcpServers?.[serverName]) {
+				throw new Error(`Server "${serverName}" not found in settings`)
+			}
+
+			config.mcpServers[serverName] = {
+				...config.mcpServers[serverName],
+				timeout,
+			}
+
+			await fs.writeFile(settingsPath, JSON.stringify(config, null, 2))
+
+			await this.updateServerConnections(config.mcpServers)
+		} catch (error) {
+			console.error("Failed to update server timeout:", error)
+			if (error instanceof Error) {
+				console.error("Error details:", error.message, error.stack)
+			}
+			vscode.window.showErrorMessage(
+				`Failed to update server timeout: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			throw error
+		}
 	}
 
 	async dispose(): Promise<void> {
